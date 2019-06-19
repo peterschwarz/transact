@@ -36,6 +36,7 @@ use crate::protocol::receipt::TransactionReceipt;
 use crate::protocol::transaction::TransactionPair;
 
 /// A transation and associated information required to execute it.
+#[derive(PartialEq, Eq)]
 pub struct ExecutionTask {
     pair: TransactionPair,
     context_id: ContextId,

@@ -17,6 +17,7 @@
 
 mod internal;
 mod reader;
+mod mspr;
 
 use internal::ExecutorThread;
 use reader::ExecutionTaskReader;

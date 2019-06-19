@@ -16,23 +16,10 @@
  */
 
 //! Contains the internal types and functionality of the Executor.
-//                                                                                                 -------- ExecutionAdapter
-// ---- Iterator<Item = ExecutionTask> ----\        | Single thread that                         /
-//                                           \      | listens for RegistrationChanges and       /
-// ---- Iterator<Item = ExecutionTask> ------------ | ExecutionEvents on the same channel -----/
-//                                           /                                                 \
-// ---- Iterator<Item = ExecutionTask> ----/                                                    \
-//                                                                                                --------- ExecutionAdapter
-//
 
 use std::collections::{HashMap, HashSet};
+use std::cmp::{Ord, Ordering, PartialOrd};
 use std::error::Error;
-use std::hash::{Hash, Hasher};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    mpsc::{channel, Receiver, Sender},
-    Arc,
-};
 use std::thread::JoinHandle;
 
 use log::warn;
@@ -41,43 +28,62 @@ use crate::execution::adapter::{ExecutionAdapter, ExecutionAdapterError};
 use crate::execution::{ExecutionRegistry, TransactionFamily};
 use crate::scheduler::{ExecutionTask, ExecutionTaskCompletionNotifier};
 
+use super::mspr::{priority_channel, PriorityReceiver, Sender};
+
 /// The `TransactionPair` and `ContextId` along with where to send
 /// results.
-pub type ExecutionEvent = (Box<dyn ExecutionTaskCompletionNotifier>, ExecutionTask);
-
-/// The type that gets sent to the `ExecutionAdapter`.
-pub enum ExecutionCommand {
-    /// There is an `ExecutionEvent`, the `ExecutionAdapter` will process it if it can
-    Event(Box<ExecutionEvent>),
-    /// Shut down the execution adapter.
-    Sentinel,
+pub struct ExecutionEvent {
+    notifier: Box<dyn ExecutionTaskCompletionNotifier>, 
+    task: ExecutionTask
 }
 
+impl PartialEq<ExecutionEvent> for ExecutionEvent {
+    fn eq(&self, other: &ExecutionEvent) -> bool {
+        ((&self.notifier as *const _) == (&other.notifier as *const _)
+         && self.task == other.task)
+     }
+}
+
+impl Eq for ExecutionEvent {}
+
 /// A registration or unregistration request from the `ExecutionAdapter`.
+#[derive(PartialEq, Eq)]
 pub enum RegistrationChange {
-    UnregisterRequest((TransactionFamily, NamedExecutionEventSender)),
-    RegisterRequest((TransactionFamily, NamedExecutionEventSender)),
+    UnregisterRequest(TransactionFamily),
+    RegisterRequest(TransactionFamily),
 }
 
 /// One of either a `RegistrationChange` or an `ExecutionEvent`.
 /// The single internal thread in the Executor is listening for these.
+#[derive(PartialEq, Eq)]
 pub enum ExecutorCommand {
     RegistrationChange(RegistrationChange),
     Execution(Box<ExecutionEvent>),
     Shutdown,
 }
 
+impl PartialOrd for ExecutorCommand {
+    fn partial_cmp(&self, other: &ExecutorCommand) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ExecutorCommand {
+    fn cmp(&self, other: &ExecutorCommand) -> Ordering {
+        if self == &ExecutorCommand::Shutdown {
+            Ordering::Greater
+        } else if other == &ExecutorCommand::Shutdown {
+            Ordering::Less
+        } else {
+            Ordering::Equal
+        }
+    }
+}
+
 ///`RegistrationChange` and `ExecutionEvent` multiplex sender
 pub type ExecutorCommandSender = Sender<ExecutorCommand>;
 
 ///`RegistrationChange` and `ExecutionEvent` multiplex sender
-pub type ExecutorCommandReceiver = Receiver<ExecutorCommand>;
-
-/// Sender part of a channel to send from the internal looping thread to the `ExecutionAdapter`
-pub type ExecutionEventSender = Sender<ExecutionCommand>;
-
-/// Receiver part of a channel for the `ExecutionAdapter` to receive from the internal looping thread.
-pub type ExecutionEventReceiver = Receiver<ExecutionCommand>;
+pub type ExecutorCommandReceiver = PriorityReceiver<ExecutorCommand>;
 
 /// ExecutionEvents that don't currently have a `ExecutionAdapter` to send to.
 pub type ParkedExecutionEvents = Vec<ExecutionEvent>;
@@ -86,32 +92,6 @@ pub type ParkedExecutionEvents = Vec<ExecutionEvent>;
 /// waiting for a just registered `TransactionFamily`
 pub type ParkedExecutionEventsMap = HashMap<TransactionFamily, ParkedExecutionEvents>;
 
-/// An ExecutionEventSender along with a hashable name or id.
-#[derive(Clone)]
-pub struct NamedExecutionEventSender {
-    pub sender: ExecutionEventSender,
-    name: usize,
-}
-
-impl NamedExecutionEventSender {
-    pub fn new(sender: ExecutionEventSender, name: usize) -> Self {
-        NamedExecutionEventSender { sender, name }
-    }
-}
-
-impl Hash for NamedExecutionEventSender {
-    fn hash<H: Hasher>(&self, hasher: &mut H) {
-        self.name.hash(hasher)
-    }
-}
-
-impl PartialEq for NamedExecutionEventSender {
-    fn eq(&self, other: &Self) -> bool {
-        self.name.eq(&other.name)
-    }
-}
-
-impl Eq for NamedExecutionEventSender {}
 
 #[derive(Debug)]
 pub enum ExecutorThreadError {
@@ -149,20 +129,16 @@ impl std::fmt::Display for ExecutorThreadError {
 
 pub struct ExecutorThread {
     execution_adapters: Vec<Box<ExecutionAdapter>>,
-    join_handles: Vec<JoinHandle<()>>,
     internal_thread: Option<JoinHandle<()>>,
     sender: Option<ExecutorCommandSender>,
-    stop: Arc<AtomicBool>,
 }
 
 impl ExecutorThread {
     pub fn new(execution_adapters: Vec<Box<ExecutionAdapter>>) -> Self {
         ExecutorThread {
             execution_adapters,
-            join_handles: vec![],
             internal_thread: None,
             sender: None,
-            stop: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -172,38 +148,9 @@ impl ExecutorThread {
 
     pub fn start(&mut self) -> Result<(), ExecutorThreadError> {
         if self.sender.is_none() {
-            let (registry_sender, receiver) = channel();
+            let (sender, receiver) = priority_channel();
 
-            for (index, mut execution_adapter) in self.execution_adapters.drain(0..).enumerate() {
-                let (sender, adapter_receiver) = channel();
-                let ee_sender = NamedExecutionEventSender::new(sender, index);
-
-                if let Err(err) = execution_adapter.start(Box::new(InternalRegistry {
-                    event_sender: ee_sender,
-                    registry_sender: registry_sender.clone(),
-                })) {
-                    warn!("Unable to start execution adapter: {}", err);
-                    return Err(ExecutorThreadError::ResourcesUnavailable);
-                }
-
-                match Self::start_execution_adapter_thread(
-                    Arc::clone(&self.stop),
-                    execution_adapter,
-                    adapter_receiver,
-                    &registry_sender,
-                    index,
-                ) {
-                    Ok(join_handle) => {
-                        self.join_handles.push(join_handle);
-                    }
-                    Err(err) => {
-                        warn!("Unable to start thread for execution adapter: {}", err);
-                        return Err(ExecutorThreadError::ResourcesUnavailable);
-                    }
-                }
-            }
-
-            self.sender = Some(registry_sender);
+            self.sender = Some(sender);
             match self.start_thread(receiver) {
                 Ok(join_handle) => {
                     self.internal_thread = Some(join_handle);
@@ -222,8 +169,6 @@ impl ExecutorThread {
 
     pub fn stop(mut self) {
         if let Some(sender) = self.sender.take() {
-            self.stop.store(true, Ordering::Relaxed);
-
             if let Err(err) = sender.send(ExecutorCommand::Shutdown) {
                 warn!("Unable to send shutdown signal to executor thread: {}", err);
             }
@@ -236,122 +181,82 @@ impl ExecutorThread {
         }
     }
 
-    fn start_execution_adapter_thread(
-        stop: Arc<AtomicBool>,
+    fn handle_execution_task(
         execution_adapter: Box<ExecutionAdapter>,
-        receiver: ExecutionEventReceiver,
-        sender: &ExecutorCommandSender,
-        index: usize,
+        completion_notifier: ExecutionTaskCompletionNotification,
+        task: ExecutionTask
     ) -> Result<JoinHandle<()>, std::io::Error> {
-        let sender = sender.clone();
+                let (pair, context_id) = task.take();
 
-        std::thread::Builder::new()
-            .name(format!("execution_adapter_thread_{}", index))
-            .spawn(move || loop {
-                if let Ok(execution_command) = receiver.recv() {
-                    match execution_command {
-                        ExecutionCommand::Event(execution_event) => {
-                            let sender = sender.clone();
-                            let (completion_notifier, task) = *execution_event;
-                            let (pair, context_id) = task.take();
-
-                            let callback = Box::new(move |result| {
-                                // Without this line, the function is considered a FnOnce, instead
-                                // of an Fn.  This seems to be a strange quirk of the compiler
-                                let completion_notifier = completion_notifier.clone();
-                                match result {
-                                    Ok(tp_processing_result) => {
-                                        completion_notifier.notify(tp_processing_result);
-                                    }
-                                    Err(ExecutionAdapterError::TimeoutError(transaction_pair)) => {
-                                        let execution_task =
-                                            ExecutionTask::new(*transaction_pair, context_id);
-                                        let execution_event = (completion_notifier, execution_task);
-                                        if let Err(err) = sender.send(ExecutorCommand::Execution(
-                                            Box::new(execution_event),
-                                        )) {
-                                            warn!("During retry of TimeOutError: {}", err);
-                                        }
-                                    }
-                                    Err(ExecutionAdapterError::RoutingError(transaction_pair)) => {
-                                        let execution_task =
-                                            ExecutionTask::new(*transaction_pair, context_id);
-                                        let execution_event = (completion_notifier, execution_task);
-                                        if let Err(err) = sender.send(ExecutorCommand::Execution(
-                                            Box::new(execution_event),
-                                        )) {
-                                            warn!("During retry of RoutingError: {}", err);
-                                        }
-                                    }
-                                    Err(ExecutionAdapterError::GeneralExecutionError(err)) => {
-                                        error!("General Execution Error: {}", err);
-                                    }
-                                }
-                            });
-                            if let Err(err) = execution_adapter.execute(pair, context_id, callback)
-                            {
-                                error!("Unable to execute on adapter {}: {}", index, err);
-                                break;
+                let callback = Box::new(move |result| {
+                    // Without this line, the function is considered a FnOnce, instead
+                    // of an Fn.  This seems to be a strange quirk of the compiler
+                    let completion_notifier = completion_notifier.clone();
+                    match result {
+                        Ok(tp_processing_result) => {
+                            completion_notifier.notify(tp_processing_result);
+                        }
+                        Err(ExecutionAdapterError::TimeoutError(transaction_pair)) => {
+                            let execution_task =
+                                ExecutionTask::new(*transaction_pair, context_id);
+                            let execution_event = (completion_notifier, execution_task);
+                            if let Err(err) = sender.send(ExecutorCommand::Execution(
+                                Box::new(execution_event),
+                            )) {
+                                warn!("During retry of TimeOutError: {}", err);
                             }
                         }
-                        ExecutionCommand::Sentinel => {
-                            if let Err(err) = execution_adapter.stop() {
-                                error!("Unable to cleanly stop adapter {}: {}", index, err);
+                        Err(ExecutionAdapterError::RoutingError(transaction_pair)) => {
+                            let execution_task =
+                                ExecutionTask::new(*transaction_pair, context_id);
+                            let execution_event = (completion_notifier, execution_task);
+                            if let Err(err) = sender.send(ExecutorCommand::Execution(
+                                Box::new(execution_event),
+                            )) {
+                                warn!("During retry of RoutingError: {}", err);
                             }
-                            break;
+                        }
+                        Err(ExecutionAdapterError::GeneralExecutionError(err)) => {
+                            error!("General Execution Error: {}", err);
                         }
                     }
-                } else if stop.load(Ordering::Relaxed) {
-                    if let Err(err) = execution_adapter.stop() {
-                        error!("Unable to cleanly stop adapter {}: {}", index, err);
-                    }
+                });
+                if let Err(err) = execution_adapter.execute(pair, context_id, callback)
+                {
+                    error!("Unable to execute on adapter {}: {}", index, err);
                     break;
                 }
-            })
-    }
+            }
 
     fn start_thread(
         &self,
         receiver: ExecutorCommandReceiver,
     ) -> Result<JoinHandle<()>, std::io::Error> {
-        let stop = Arc::clone(&self.stop);
         std::thread::Builder::new()
             .name("internal_executor_thread".to_string())
             .spawn(move || {
-                let mut fanout_threads: HashMap<
-                    TransactionFamily,
-                    HashSet<NamedExecutionEventSender>,
-                > = HashMap::new();
                 let mut parked: ParkedExecutionEventsMap = HashMap::new();
                 let mut unparked = vec![];
                 loop {
                     for execution_event in unparked.drain(0..) {
-                        Self::try_send_execution_event(
+                        Self::try_execute_event(
                             Box::new(execution_event),
-                            &fanout_threads,
+                            &self.execution_adapters,
                             &mut parked,
                         );
                     }
 
                     match receiver.recv() {
                         Ok(ExecutorCommand::Execution(execution_event)) => {
-                            if stop.load(Ordering::Relaxed) {
-                                Self::shutdown_fanout_threads(&fanout_threads);
-                                break;
-                            }
-                            Self::try_send_execution_event(
+                            Self::try_execute_event(
                                 execution_event,
-                                &fanout_threads,
+                                &self.execution_adapters,
                                 &mut parked,
                             )
                         }
                         Ok(ExecutorCommand::RegistrationChange(
                             RegistrationChange::RegisterRequest((transaction_family, sender)),
                         )) => {
-                            if stop.load(Ordering::Relaxed) {
-                                Self::shutdown_fanout_threads(&fanout_threads);
-                                break;
-                            }
 
                             if let Some(p) = parked.get_mut(&transaction_family) {
                                 unparked.append(p);
@@ -395,30 +300,12 @@ impl ExecutorThread {
             })
     }
 
-    fn shutdown_fanout_threads(
-        fanout_threads: &HashMap<TransactionFamily, HashSet<NamedExecutionEventSender>>,
-    ) {
-        for sender in fanout_threads
-            .values()
-            .fold(HashSet::new(), |mut set, item| {
-                for s in item {
-                    set.insert(s);
-                }
-                set
-            })
-        {
-            if let Err(err) = sender.sender.send(ExecutionCommand::Sentinel) {
-                warn!("During stop of ExecutorThread internal thread: {}", err);
-            }
-        }
-    }
-
-    fn try_send_execution_event(
+    fn try_execute_event(
         execution_event: Box<ExecutionEvent>,
-        fanout_threads: &HashMap<TransactionFamily, HashSet<NamedExecutionEventSender>>,
+        execution_adapters: &[Box<ExecutionAdapter>],
         parked: &mut ParkedExecutionEventsMap,
     ) {
-        let tf = TransactionFamily::from_pair(&execution_event.1.pair());
+        let tf = TransactionFamily::from_pair(&execution_event.task.pair());
         if let Some(ea_senders) = fanout_threads.get(&tf) {
             if let Some(sender) = ea_senders.iter().nth(0) {
                 if let Err(err) = sender.sender.send(ExecutionCommand::Event(execution_event)) {

@@ -37,12 +37,12 @@ use crate::signing;
 
 static DEFAULT_NONCE_SIZE: usize = 32;
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum HashMethod {
     SHA512,
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct TransactionHeader {
     batcher_public_key: Vec<u8>,
     dependencies: Vec<Vec<u8>>,
@@ -184,7 +184,7 @@ impl IntoBytes for TransactionHeader {
 impl IntoProto<protos::transaction::TransactionHeader> for TransactionHeader {}
 impl IntoNative<TransactionHeader> for protos::transaction::TransactionHeader {}
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Transaction {
     header: Vec<u8>,
     header_signature: String,
@@ -232,7 +232,7 @@ impl From<protos::transaction::Transaction> for Transaction {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct TransactionPair {
     transaction: Transaction,
     header: TransactionHeader,
