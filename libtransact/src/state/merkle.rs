@@ -1867,10 +1867,10 @@ mod tests {
     }
 
     fn make_lmdb(merkle_path: &str) -> Box<LmdbDatabase> {
-        let ctx = LmdbContext::new(
+        let ctx = LmdbContext::with_initial_size(
             Path::new(merkle_path),
             INDEXES.len(),
-            Some(120 * 1024 * 1024),
+            120 * 1024 * 1024,
         )
         .map_err(|err| DatabaseError::InitError(format!("{}", err)))
         .unwrap();

@@ -28,18 +28,28 @@ use lmdb_zero as lmdb;
 
 use crate::database::error::DatabaseError;
 
-const DEFAULT_SIZE: usize = 1 << 40; // 1024 ** 4
-
 #[derive(Clone)]
 pub struct LmdbContext {
     pub env: Arc<lmdb::Environment>,
 }
 
 impl LmdbContext {
-    pub fn new(
+    pub fn new(filepath: &Path, indexes: usize) -> Result<Self, DatabaseError> {
+        Self::new_with_opts(filepath, indexes, None)
+    }
+
+    pub fn with_initial_size(
         filepath: &Path,
         indexes: usize,
-        size: Option<usize>,
+        initial_size: usize,
+    ) -> Result<Self, DatabaseError> {
+        Self::new_with_opts(filepath, indexes, Some(initial_size))
+    }
+
+    fn new_with_opts(
+        filepath: &Path,
+        indexes: usize,
+        initial_size: Option<usize>,
     ) -> Result<Self, DatabaseError> {
         let flags = lmdb::open::MAPASYNC
             | lmdb::open::WRITEMAP
@@ -56,9 +66,12 @@ impl LmdbContext {
         builder
             .set_maxdbs((indexes + 1) as u32)
             .map_err(|err| DatabaseError::InitError(format!("Failed to set MAX_DBS: {}", err)))?;
-        builder
-            .set_mapsize(size.unwrap_or(DEFAULT_SIZE))
-            .map_err(|err| DatabaseError::InitError(format!("Failed to set MAP_SIZE: {}", err)))?;
+
+        if initial_size.is_some() {
+            builder
+                .set_mapsize(initial_size.unwrap())
+                .map_err(|err| DatabaseError::InitError(format!("Failed to set MAP_SIZE: {}", err)))?;
+        }
 
         let env = unsafe {
             builder
@@ -298,9 +311,14 @@ impl<'a> DatabaseWriter for LmdbDatabaseWriter<'a> {
     }
 
     fn commit(self: Box<Self>) -> Result<(), DatabaseError> {
-        self.txn
-            .commit()
-            .map_err(|err| DatabaseError::WriterError(format!("{}", err)))
+        match self.txn .commit() {
+            Ok(()) => Ok(()),
+            Err(lmdb::error::Error::Code(lmdb::error::MAP_FULL)) => {
+                // resize
+                unimplemented!()
+            }
+            Err(err) => Err(DatabaseError::WriterError(format!("Unable to commit LMDB transaction: {}", err)))
+        }
     }
 
     fn as_reader(&self) -> &dyn DatabaseReader {
@@ -430,7 +448,7 @@ mod tests {
     #[test]
     fn test_lmdb() {
         run_test(|blockstore_path| {
-            let ctx = LmdbContext::new(Path::new(blockstore_path), 3, Some(1024 * 1024))
+            let ctx = LmdbContext::new(Path::new(blockstore_path), 3)
                 .map_err(|err| DatabaseError::InitError(format!("{}", err)))
                 .unwrap();
 
