@@ -16,8 +16,8 @@
 //!
 //! This is an experimental feature, and is only available by enabling the "redis-db" feature.
 
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use redis::{self, Commands, PipelineCommands};
 
@@ -27,6 +27,7 @@ use super::{Database, DatabaseCursor, DatabaseError, DatabaseReader, DatabaseWri
 #[derive(Clone)]
 pub struct RedisDatabase {
     client: redis::Client,
+    conn: Arc<Mutex<redis::Connection>>,
     primary: String,
     indexes: HashSet<String>,
 }
@@ -45,10 +46,14 @@ impl RedisDatabase {
             .iter()
             .map(|s| format!("{}_{}", primary, s))
             .collect();
+        let client = redis::Client::open(url)
+            .map_err(|e| DatabaseError::InitError(format!("failed to open redis client: {}", e)))?;
+        let conn = client
+            .get_connection()
+            .map_err(|e| DatabaseError::ReaderError(format!("failed to create reader: {}", e)))?;
         Ok(Self {
-            client: redis::Client::open(url).map_err(|e| {
-                DatabaseError::InitError(format!("failed to open redis client: {}", e))
-            })?,
+            client,
+            conn: Arc::new(Mutex::new(conn)),
             primary,
             indexes,
         })
@@ -57,22 +62,11 @@ impl RedisDatabase {
 
 impl Database for RedisDatabase {
     fn get_reader<'a>(&'a self) -> Result<Box<dyn DatabaseReader + 'a>, DatabaseError> {
-        let conn = self
-            .client
-            .get_connection()
-            .map_err(|e| DatabaseError::ReaderError(format!("failed to create reader: {}", e)))?;
-        Ok(Box::new(RedisDatabaseReader {
-            conn: RefCell::new(conn),
-            db: self,
-        }))
+        Ok(Box::new(RedisDatabaseReader { db: self }))
     }
 
     fn get_writer<'a>(&'a self) -> Result<Box<dyn DatabaseWriter + 'a>, DatabaseError> {
-        let conn = self
-            .client
-            .get_connection()
-            .map_err(|e| DatabaseError::ReaderError(format!("failed to create reader: {}", e)))?;
-        Ok(Box::new(RedisDatabaseWriter::new(self, conn)))
+        Ok(Box::new(RedisDatabaseWriter::new(self)))
     }
 
     fn clone_box(&self) -> Box<dyn Database> {
@@ -81,7 +75,6 @@ impl Database for RedisDatabase {
 }
 
 struct RedisDatabaseReader<'db> {
-    conn: RefCell<redis::Connection>,
     db: &'db RedisDatabase,
 }
 
@@ -98,15 +91,17 @@ impl<'db> RedisDatabaseReader<'db> {
             )));
         }
 
-        apply(&index_name, &mut self.conn.borrow_mut())
+        apply(&index_name, &mut self.db.conn.lock().unwrap())
     }
 }
 
 impl<'db> DatabaseReader for RedisDatabaseReader<'db> {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         match self
+            .db
             .conn
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .hget::<_, _, Option<Vec<u8>>>(&self.db.primary, key)
         {
             Ok(Some(bytes)) => Some(bytes),
@@ -144,8 +139,10 @@ impl<'db> DatabaseReader for RedisDatabaseReader<'db> {
     }
 
     fn count(&self) -> Result<usize, DatabaseError> {
-        self.conn
-            .borrow_mut()
+        self.db
+            .conn
+            .lock()
+            .unwrap()
             .hlen::<_, usize>(&self.db.primary)
             .map_err(|e| DatabaseError::ReaderError(format!("unable to count: {}", e)))
     }
@@ -166,23 +163,18 @@ enum Update {
 }
 
 struct RedisDatabaseWriter<'db> {
-    conn: RefCell<redis::Connection>,
     db: &'db RedisDatabase,
     changes: HashMap<String, HashMap<Vec<u8>, Update>>,
 }
 
 impl<'db> RedisDatabaseWriter<'db> {
-    fn new(db: &'db RedisDatabase, conn: redis::Connection) -> Self {
+    fn new(db: &'db RedisDatabase) -> Self {
         let mut changes = HashMap::new();
         changes.insert(db.primary.clone(), HashMap::new());
         for index in db.indexes.iter() {
             changes.insert(index.clone(), HashMap::new());
         }
-        Self {
-            conn: RefCell::new(conn),
-            db,
-            changes,
-        }
+        Self { db, changes }
     }
 
     fn with_index_mut<T, F>(&mut self, index: &str, apply: F) -> Result<T, DatabaseError>
@@ -220,7 +212,7 @@ impl<'db> RedisDatabaseWriter<'db> {
             .changes
             .get(&index_name)
             .expect("No change map for primary, but should have been set in constructor");
-        apply(&index_name, change_set, &mut self.conn.borrow_mut())
+        apply(&index_name, change_set, &mut self.db.conn.lock().unwrap())
     }
 }
 
@@ -238,8 +230,10 @@ impl<'db> DatabaseWriter for RedisDatabaseWriter<'db> {
             Some(_) => return Err(DatabaseError::DuplicateEntry),
             None => {
                 if self
+                    .db
                     .conn
-                    .borrow_mut()
+                    .lock()
+                    .unwrap()
                     .hexists::<_, _, bool>(&self.db.primary, key)
                     .map_err(|e| {
                         DatabaseError::WriterError(format!(
@@ -315,7 +309,7 @@ impl<'db> DatabaseWriter for RedisDatabaseWriter<'db> {
         }
 
         pipeline
-            .query(&mut *self.conn.borrow_mut())
+            .query(&mut *self.db.conn.lock().unwrap())
             .map_err(|e| DatabaseError::WriterError(format!("unable to commit: {}", e)))?;
 
         Ok(())
@@ -340,8 +334,10 @@ impl<'db> DatabaseReader for RedisDatabaseWriter<'db> {
         };
 
         match self
+            .db
             .conn
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .hget::<_, _, Option<Vec<u8>>>(&self.db.primary, key)
         {
             Ok(Some(bytes)) => Some(bytes),
@@ -386,8 +382,10 @@ impl<'db> DatabaseReader for RedisDatabaseWriter<'db> {
     }
 
     fn count(&self) -> Result<usize, DatabaseError> {
-        self.conn
-            .borrow_mut()
+        self.db
+            .conn
+            .lock()
+            .unwrap()
             .hlen::<_, usize>(&self.db.primary)
             .map_err(|e| DatabaseError::ReaderError(format!("unable to count: {}", e)))
     }
