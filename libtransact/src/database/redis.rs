@@ -78,6 +78,16 @@ struct RedisDatabaseReader<'db> {
     db: &'db RedisDatabase,
 }
 
+macro_rules! unlock_conn {
+    ($self:ident, $err:path) => {{
+        $self
+            .db
+            .conn
+            .lock()
+            .map_err(|_| $err("RedisDatabase connection lock was poisoned.".into()))
+    }};
+}
+
 impl<'db> RedisDatabaseReader<'db> {
     fn with_index<T, F>(&self, index: &str, apply: F) -> Result<T, DatabaseError>
     where
@@ -91,19 +101,23 @@ impl<'db> RedisDatabaseReader<'db> {
             )));
         }
 
-        apply(&index_name, &mut self.db.conn.lock().unwrap())
+        apply(
+            &index_name,
+            &mut *unlock_conn!(self, DatabaseError::ReaderError)?,
+        )
     }
 }
 
 impl<'db> DatabaseReader for RedisDatabaseReader<'db> {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        match self
-            .db
-            .conn
-            .lock()
-            .unwrap()
-            .hget::<_, _, Option<Vec<u8>>>(&self.db.primary, key)
-        {
+        let mut conn = match unlock_conn!(self, DatabaseError::ReaderError) {
+            Ok(conn) => conn,
+            Err(e) => {
+                error!("{}", e.to_string());
+                return None;
+            }
+        };
+        match conn.hget::<_, _, Option<Vec<u8>>>(&self.db.primary, key) {
             Ok(Some(bytes)) => Some(bytes),
             Ok(None) => None,
             Err(err) => {
@@ -139,10 +153,7 @@ impl<'db> DatabaseReader for RedisDatabaseReader<'db> {
     }
 
     fn count(&self) -> Result<usize, DatabaseError> {
-        self.db
-            .conn
-            .lock()
-            .unwrap()
+        unlock_conn!(self, DatabaseError::ReaderError)?
             .hlen::<_, usize>(&self.db.primary)
             .map_err(|e| DatabaseError::ReaderError(format!("unable to count: {}", e)))
     }
@@ -212,7 +223,11 @@ impl<'db> RedisDatabaseWriter<'db> {
             .changes
             .get(&index_name)
             .expect("No change map for primary, but should have been set in constructor");
-        apply(&index_name, change_set, &mut self.db.conn.lock().unwrap())
+        apply(
+            &index_name,
+            change_set,
+            &mut *unlock_conn!(self, DatabaseError::WriterError)?,
+        )
     }
 }
 
@@ -229,11 +244,7 @@ impl<'db> DatabaseWriter for RedisDatabaseWriter<'db> {
             }
             Some(_) => return Err(DatabaseError::DuplicateEntry),
             None => {
-                if self
-                    .db
-                    .conn
-                    .lock()
-                    .unwrap()
+                if unlock_conn!(self, DatabaseError::WriterError)?
                     .hexists::<_, _, bool>(&self.db.primary, key)
                     .map_err(|e| {
                         DatabaseError::WriterError(format!(
@@ -309,7 +320,7 @@ impl<'db> DatabaseWriter for RedisDatabaseWriter<'db> {
         }
 
         pipeline
-            .query(&mut *self.db.conn.lock().unwrap())
+            .query(&mut *unlock_conn!(self, DatabaseError::WriterError)?)
             .map_err(|e| DatabaseError::WriterError(format!("unable to commit: {}", e)))?;
 
         Ok(())
@@ -333,13 +344,15 @@ impl<'db> DatabaseReader for RedisDatabaseWriter<'db> {
             None => (),
         };
 
-        match self
-            .db
-            .conn
-            .lock()
-            .unwrap()
-            .hget::<_, _, Option<Vec<u8>>>(&self.db.primary, key)
-        {
+        let mut conn = match unlock_conn!(self, DatabaseError::WriterError) {
+            Ok(conn) => conn,
+            Err(e) => {
+                error!("{}", e.to_string());
+                return None;
+            }
+        };
+
+        match conn.hget::<_, _, Option<Vec<u8>>>(&self.db.primary, key) {
             Ok(Some(bytes)) => Some(bytes),
             Ok(None) => None,
             Err(err) => {
@@ -382,10 +395,7 @@ impl<'db> DatabaseReader for RedisDatabaseWriter<'db> {
     }
 
     fn count(&self) -> Result<usize, DatabaseError> {
-        self.db
-            .conn
-            .lock()
-            .unwrap()
+        unlock_conn!(self, DatabaseError::ReaderError)?
             .hlen::<_, usize>(&self.db.primary)
             .map_err(|e| DatabaseError::ReaderError(format!("unable to count: {}", e)))
     }
