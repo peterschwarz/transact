@@ -81,22 +81,25 @@ impl ContextManager {
         context_id: &ContextId,
     ) -> Result<&mut Context, ContextManagerError> {
         self.contexts.get_mut(context_id).ok_or_else(|| {
-            ContextManagerError::MissingContextError(
-                str::from_utf8(context_id)
-                    .expect("Unable to generate string from ContextId")
-                    .to_string(),
-            )
+            warn!("missing context");
+            let ctx_id_str = str::from_utf8(context_id)
+                .expect("Unable to generate string from ContextId")
+                .to_string();
+            warn!("missing ctx id {}", ctx_id_str);
+            ContextManagerError::MissingContextError(ctx_id_str)
         })
     }
 
     /// Returns a Context within the ContextManager's Context list specified by the ContextId
     fn get_context(&self, context_id: &ContextId) -> Result<&Context, ContextManagerError> {
         self.contexts.get(context_id).ok_or_else(|| {
-            ContextManagerError::MissingContextError(
-                str::from_utf8(context_id)
-                    .expect("Unable to generate string from ContextId")
-                    .to_string(),
-            )
+            warn!("missing context");
+            let ctx_id_str = str::from_utf8(context_id)
+                .expect("Unable to generate string from ContextId")
+                .to_string();
+            warn!("missing ctx id {}", ctx_id_str);
+
+            ContextManagerError::MissingContextError(ctx_id_str)
         })
     }
 
@@ -297,6 +300,18 @@ mod tests {
             }
             TransactionResult::Invalid { .. } => panic!("transaction result is invalid"),
         }
+    }
+
+    #[test]
+    fn get_missing_context() {
+        let (manager, _) = make_manager(None);
+
+        let invalid_ctx_id = *uuid::Uuid::new_v4().as_bytes();
+        let context = manager.get_context(&invalid_ctx_id);
+        assert!(matches!(
+            context,
+            Err(ContextManagerError::MissingContextError(_))
+        ));
     }
 
     #[test]

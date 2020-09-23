@@ -94,6 +94,7 @@ impl ExecutionTaskSubmitter {
         task_iterator: Box<dyn Iterator<Item = ExecutionTask> + Send>,
         notifier: Box<dyn ExecutionTaskCompletionNotifier>,
     ) -> Result<(), ExecutorError> {
+        info!("Submitting schedule to background thread");
         self.sender
             .send(ExecutorCommand::CreateReader(task_iterator, notifier))
             .map_err(|_| {

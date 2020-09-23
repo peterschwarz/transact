@@ -52,6 +52,7 @@ impl ExecutionTaskReader {
     ) -> Result<(), std::io::Error> {
         let stop = Arc::clone(&self.stop);
 
+        info!("Spawning reader {}", self.id);
         if self.threads.is_none() {
             let reader_id = self.id;
             let join_handle = thread::Builder::new()
@@ -61,11 +62,13 @@ impl ExecutionTaskReader {
                         "ExecutionTaskReader-{}",
                         reader_id
                     ));
+                    info!("Beginning task iteration on reader {}", reader_id);
                     for execution_task in task_iterator {
                         if stop.load(Ordering::Relaxed) {
                             break;
                         }
 
+                        info!("Received task");
                         let execution_event = (notifier.clone(), execution_task);
                         let event = ExecutorCommand::Execution(Box::new(execution_event));
 

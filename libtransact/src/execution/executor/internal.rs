@@ -50,6 +50,15 @@ pub enum ExecutionCommand {
     Sentinel,
 }
 
+impl std::fmt::Display for ExecutionCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(match self {
+            ExecutionCommand::Event(_) => "Event",
+            ExecutionCommand::Sentinel => "Sentinal"
+        })
+    }
+}
+
 /// A registration or unregistration request from the `ExecutionAdapter`.
 pub enum RegistrationChange {
     UnregisterRequest((TransactionFamily, NamedExecutionEventSender)),
@@ -67,6 +76,18 @@ pub enum ExecutorCommand {
     ),
     ReaderDone(usize),
     Shutdown,
+}
+
+impl std::fmt::Display for ExecutorCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(match self {
+            ExecutorCommand::RegistrationChange(_) => "RegistrationChange",
+            ExecutorCommand::Execution(_) => "Execution",
+            ExecutorCommand::CreateReader(_, _) => "CreateReader",
+            ExecutorCommand::ReaderDone(_) => "ReaderDone",
+            ExecutorCommand::Shutdown => "Shutdown",
+        })
+    }
 }
 
 ///`RegistrationChange` and `ExecutionEvent` multiplex sender
@@ -231,9 +252,19 @@ impl ExecutorThread {
             .spawn(move || {
                 let _monitor =
                     crate::thread::PanicMonitor::new(format!("execution_adapter_thread_{}", index));
-                while let Ok(execution_command) = receiver.recv() {
-                    match execution_command {
-                        ExecutionCommand::Event(execution_event) => {
+                debug!("Receiving next message");
+                loop {
+                    let received = receiver.recv();
+                    debug!(
+                        "Received event or hung up? {}",
+                        if received.is_err() {
+                            "hung up".into()
+                        } else {
+                            format!("received {}", received.as_ref().unwrap())
+                        }
+                    );
+                    match received {
+                        Ok(ExecutionCommand::Event(execution_event)) => {
                             let sender = sender.clone();
                             let (completion_notifier, task) = *execution_event;
                             let (pair, context_id) = task.take();
@@ -277,7 +308,11 @@ impl ExecutorThread {
                                 break;
                             }
                         }
-                        ExecutionCommand::Sentinel => {
+                        Ok(ExecutionCommand::Sentinel) => {
+                            break;
+                        }
+                        Err(_) => {
+                            error!("Unexpected hang up");
                             break;
                         }
                     }
@@ -307,6 +342,7 @@ impl ExecutorThread {
                 let mut reader_index = 0usize;
                 let mut readers: BTreeMap<usize, ExecutionTaskReader> = BTreeMap::new();
                 loop {
+                    debug!("Draining unparked events");
                     for execution_event in unparked.drain(0..) {
                         Self::try_send_execution_event(
                             Box::new(execution_event),
@@ -315,7 +351,17 @@ impl ExecutorThread {
                         );
                     }
 
-                    match receiver.recv() {
+                    debug!("Receiving next message");
+                    let received = receiver.recv();
+                    debug!(
+                        "Received message or hung up? {}",
+                        if received.is_err() {
+                            "hung up".into()
+                        } else {
+                            format!("received {}", received.as_ref().unwrap())
+                        }
+                    );
+                    match received {
                         Ok(ExecutorCommand::Execution(execution_event)) => {
                             Self::try_send_execution_event(
                                 execution_event,
@@ -326,6 +372,7 @@ impl ExecutorThread {
                         Ok(ExecutorCommand::RegistrationChange(
                             RegistrationChange::RegisterRequest((transaction_family, sender)),
                         )) => {
+                            debug!("Registered transaction family {:?}", transaction_family);
                             if let Some(p) = parked.get_mut(&transaction_family) {
                                 unparked.append(p);
                             }
@@ -359,6 +406,7 @@ impl ExecutorThread {
 
                         Ok(ExecutorCommand::CreateReader(task_iterator, notifier)) => {
                             let (index, _) = reader_index.overflowing_add(1);
+                            info!("Received schedule, running reader {}", index);
                             let mut reader = ExecutionTaskReader::new(index);
 
                             if let Err(err) = reader.start(task_iterator, notifier, sender.clone())
@@ -378,6 +426,7 @@ impl ExecutorThread {
                         }
 
                         Ok(ExecutorCommand::Shutdown) => {
+                            error!("Shutting down executor thread");
                             break;
                         }
                         Err(err) => {
