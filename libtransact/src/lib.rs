@@ -129,6 +129,7 @@ pub mod protos;
 pub mod sawtooth;
 pub mod scheduler;
 pub mod state;
+pub(crate) mod thread;
 #[cfg(feature = "workload")]
 pub mod workload;
 

@@ -229,6 +229,8 @@ impl ExecutorThread {
         std::thread::Builder::new()
             .name(format!("execution_adapter_thread_{}", index))
             .spawn(move || {
+                let _monitor =
+                    crate::thread::PanicMonitor::new(format!("execution_adapter_thread_{}", index));
                 while let Ok(execution_command) = receiver.recv() {
                     match execution_command {
                         ExecutionCommand::Event(execution_event) => {
@@ -295,6 +297,7 @@ impl ExecutorThread {
         std::thread::Builder::new()
             .name("internal_executor_thread".to_string())
             .spawn(move || {
+                let _monitor = crate::thread::PanicMonitor::new("internal_executor_thread".into());
                 let mut fanout_threads: HashMap<
                     TransactionFamily,
                     HashSet<NamedExecutionEventSender>,

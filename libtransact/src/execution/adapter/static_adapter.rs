@@ -62,6 +62,7 @@ impl StaticExecutionAdapter {
         let join_handle = thread::Builder::new()
             .name("StaticExecutionAdapter".into())
             .spawn(move || {
+                let _monitor = crate::thread::PanicMonitor::new("StaticExecutionAdapter".into());
                 while let Ok(cmd) = receiver.recv() {
                     match cmd {
                         StaticAdapterCommand::Execute(execute_cmd) => {

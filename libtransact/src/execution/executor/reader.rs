@@ -57,6 +57,10 @@ impl ExecutionTaskReader {
             let join_handle = thread::Builder::new()
                 .name(format!("ExecutionTaskReader-{}", self.id))
                 .spawn(move || {
+                    let _monitor = crate::thread::PanicMonitor::new(format!(
+                        "ExecutionTaskReader-{}",
+                        reader_id
+                    ));
                     for execution_task in task_iterator {
                         if stop.load(Ordering::Relaxed) {
                             break;

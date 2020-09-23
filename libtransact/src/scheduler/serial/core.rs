@@ -441,6 +441,7 @@ impl SchedulerCore {
         thread::Builder::new()
             .name(String::from("Thread-SerialScheduler"))
             .spawn(move || {
+                let _monitor = crate::thread::PanicMonitor::new("Thread-SerialScheduler".into());
                 if let Err(err) = self.run() {
                     // Attempt to send notification using the error callback; if that fails, just
                     // log it.
