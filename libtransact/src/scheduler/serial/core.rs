@@ -211,11 +211,10 @@ impl SchedulerCore {
             return Ok(());
         }
 
+        if !self.next_ready {
+            return Ok(());
+        }
         if self.current_batch.is_none() {
-            if !self.next_ready {
-                return Ok(());
-            }
-
             match self.shared_lock.lock()?.pop_unscheduled_batch() {
                 Some(unscheduled_batch) => {
                     self.txn_queue =
